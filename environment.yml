@@ -6,3 +6,5 @@ dependencies:
   - pip
   - pip:
       - demucs
+      - ffmpeg-python
+      - ffmpeg-normalize

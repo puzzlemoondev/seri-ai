@@ -1,16 +1,25 @@
 #!/usr/bin/env python3
 
 import os
+import ffmpeg
 import argparse
 import subprocess
 
 from math import ceil
 from pathlib import Path
 from typing import Optional
+from secrets import token_hex
+from datetime import datetime
 from dataclasses import dataclass
 from collections.abc import Iterable
+from tempfile import TemporaryDirectory
+from ffmpeg_normalize import FFmpegNormalize
+
+IDEAL_CHUNK_LENGTH = 8
+MIN_CHUNK_LENGTH = 5
 
 OUTPUT_FOLDER = Path("data/raw/seri")
+SEPARATED_FOLDER = Path("separated")
 
 
 @dataclass
@@ -20,141 +29,213 @@ class TimeRange:
 
 
 @dataclass
-class Operation:
+class SingleSourceOperation:
     source: Path
     section_output: Path
     section_range: Optional[TimeRange]
 
 
-def get_section_ranges(cue_file: Path) -> Iterable[TimeRange]:
-    with open(cue_file) as f:
-        for line in f:
-            timestamps = line.strip().split("-")
-            if len(timestamps) == 2:
-                yield TimeRange(timestamps[0], timestamps[1])
+@dataclass
+class MultiSourceOperation:
+    source_list: list[Path]
+    output_folder: Path
 
 
-def extract_section(
-    source: Path, output: Path, section_range: Optional[TimeRange] = None
-) -> Path:
-    ffmpeg_args = [
-        "ffmpeg",
-        "-y",
-        "-i",
-        source,
-        "-ac",
-        "2",
-        "-ar",
-        "44100",
-        "-f",
-        "wav",
-        output,
-    ]
+class SingelSourceOperationResolver:
+    def __init__(self, path: Path):
+        self.path = path
 
-    if section_range is not None:
-        ffmpeg_args[1:1] = [
-            "-ss",
-            section_range.start,
-            "-to",
-            section_range.end,
+    def __iter__(self) -> Iterable[SingleSourceOperation]:
+        yield from self.get_operations(self.path)
+
+    def get_operations(self, source: Path) -> Iterable[SingleSourceOperation]:
+        if source.is_dir():
+            for child in source.iterdir():
+                yield from self.get_operations(child)
+        elif source.suffix != ".cue":
+            cue_file = source.with_suffix(".cue")
+            if cue_file.exists():
+                section_ranges = self.get_section_ranges(cue_file)
+                for index, section_range in enumerate(section_ranges):
+                    output = source.with_name(f"{source.stem}_{index}.wav")
+                    yield SingleSourceOperation(source, output, section_range)
+
+    def get_section_ranges(self, cue_file: Path) -> Iterable[TimeRange]:
+        with open(cue_file) as f:
+            for line in f:
+                timestamps = line.strip().split("-")
+                if len(timestamps) == 2:
+                    yield TimeRange(timestamps[0], timestamps[1])
+
+
+class MultiSourceOperationResolver:
+    def __init__(self, path: Path, output_folder: Path):
+        self.path = path.resolve(strict=True)
+        self.output_folder = output_folder
+
+    def __call__(self) -> MultiSourceOperation:
+        return MultiSourceOperation(
+            list(self.path.glob(f"**/vocals.wav")), self.output_folder
+        )
+
+
+class SingleSourceOperationExecutor:
+    def __init__(self, operation: SingleSourceOperation, use_gpu: bool):
+        self.operation = operation
+        self.use_gpu = use_gpu
+
+    def __call__(self) -> Path:
+        section = self.extract_section(
+            self.operation.source,
+            self.operation.section_output,
+            self.operation.section_range,
+        )
+        vocals = self.separate_vocals(section)
+
+        return vocals.resolve(strict=True)
+
+    def extract_section(
+        self, source: Path, output: Path, section_range: Optional[TimeRange]
+    ) -> Path:
+        section_args = dict()
+        if section_range is not None:
+            section_args.update(ss=section_range.start, to=section_range.end)
+
+        (
+            ffmpeg.input(str(source))
+            .output(str(output), ac=2, ar=44100, format="wav", **section_args)
+            .run(overwrite_output=True)
+        )
+
+        return output
+
+    def separate_vocals(self, file: Path) -> Path:
+        vocal_separarion_args = ["./separate_vocals", file]
+        if self.use_gpu:
+            vocal_separarion_args.insert(1, "--gpu")
+
+        subprocess.run(vocal_separarion_args, check=True)
+
+        output = next(SEPARATED_FOLDER.glob(f"**/{file.stem}/vocals.wav"))
+
+        return output
+
+
+class MultiSourceOperationExecutor:
+    def __init__(self, operation: MultiSourceOperation):
+        self.operation = operation
+        self.workdir = TemporaryDirectory()
+
+    @property
+    def workdir_path(self):
+        return Path(self.workdir.name)
+
+    def __del__(self):
+        self.workdir.cleanup()
+
+    def __call__(self):
+        source_list = self.operation.source_list
+        if not source_list:
+            return
+
+        normalized_list = self.normalize(source_list)
+        concatenated = self.concatenate(normalized_list, "normalized")
+        silence_removed = self.remove_silence(concatenated)
+        chunks = self.get_chunks(silence_removed)
+        self.splice(silence_removed, chunks)
+
+    def normalize(self, source_list: list[Path]) -> list[Path]:
+        output_list = [
+            self.workdir_path.joinpath(f"normalized_{index}.wav")
+            for index, source in enumerate(source_list)
         ]
 
-    subprocess.run(ffmpeg_args, check=True)
+        normalizer = FFmpegNormalize(normalization_type="peak", output_format="wav")
+        for source, output in zip(source_list, output_list):
+            normalizer.add_media_file(str(source), str(output))
+        normalizer.run_normalization()
 
-    return output
+        return output_list
 
+    def concatenate(self, source_list: list[Path], source_name: str) -> Path:
+        output = self.workdir_path.joinpath(f"{source_name}_concatenated.wav")
 
-def separate_vocals(file: Path, use_gpu: bool) -> Path:
-    vocal_separarion_args = ["./separate_vocals", file]
-    if use_gpu:
-        vocal_separarion_args.insert(1, "--gpu")
+        inputs = (ffmpeg.input(str(source)) for source in source_list)
+        (
+            ffmpeg.concat(*inputs, v=0, a=1)
+            .output(str(output))
+            .run(overwrite_output=True)
+        )
 
-    subprocess.run(vocal_separarion_args, check=True)
+        return output
 
-    output = next(Path("separated").glob(f"**/{file.stem}/vocals.wav"))
+    def remove_silence(self, source: Path) -> Path:
+        output = source.with_stem(f"{source.stem}_silenceremoved")
 
-    return output
+        (
+            ffmpeg.input(str(source))
+            .filter(
+                "silenceremove",
+                stop_periods=-1,
+                stop_duration=1,
+                stop_threshold="-50dB",
+            )
+            .output(str(output))
+            .run(overwrite_output=True)
+        )
 
+        return output
 
-def remove_silence(source: Path) -> Path:
-    output = source.with_stem(f"{source.stem}_silence_removed")
+    def get_chunks(self, source: Path) -> list[int]:
+        duration_output = subprocess.check_output(
+            ["./get_duration", source], encoding="utf-8"
+        )
+        duration = ceil(float(duration_output))
 
-    ffmpeg_args = [
-        "ffmpeg",
-        "-y",
-        "-i",
-        source,
-        "-af",
-        "silenceremove=stop_periods=-1:stop_duration=1:stop_threshold=-50dB",
-        output,
-    ]
+        chunks = list(range(IDEAL_CHUNK_LENGTH, duration, IDEAL_CHUNK_LENGTH))
+        if (duration - chunks[-1]) < MIN_CHUNK_LENGTH:
+            chunks.pop()
 
-    subprocess.run(ffmpeg_args, check=True)
+        return chunks
 
-    return output
+    def splice(self, source: Path, chunks: list[int]):
+        now = datetime.now().strftime("%Y%m%d")
+        output = self.operation.output_folder.joinpath(
+            f"{source.stem}_spliced_{now}_{token_hex(3)}_%06d.wav"
+        )
 
-
-def get_chunks(source: Path) -> list[int]:
-    duration_output = subprocess.check_output(
-        ["./get_duration", source], encoding="utf-8"
-    )
-    duration = ceil(float(duration_output))
-
-    ideal_chunk_length = 10
-    min_chunk_length = 5
-    chunks = list(range(ideal_chunk_length, duration, ideal_chunk_length))
-    if (duration - chunks[-1]) <= min_chunk_length:
-        chunks.pop()
-
-    return chunks
-
-
-def splice(source: Path, chunks: list[int]):
-    output_filename = source.with_stem(f"{source.parent.name}_{source.stem}_%02d").name
-    output = OUTPUT_FOLDER.joinpath(output_filename)
-
-    ffmpeg_args = [
-        "ffmpeg",
-        "-y",
-        "-i",
-        source,
-        "-c",
-        "copy",
-        "-f",
-        "segment",
-        "-segment_times",
-        ",".join(map(str, chunks)),
-        output,
-    ]
-
-    subprocess.run(ffmpeg_args, check=True)
+        (
+            ffmpeg.input(str(source))
+            .output(
+                str(output),
+                f="segment",
+                segment_times=",".join(map(str, chunks)),
+            )
+            .run(overwrite_output=True)
+        )
 
 
-def get_operations(source: Path) -> Iterable[Operation]:
-    if source.is_dir():
-        for child in source.iterdir():
-            yield from get_operations(child)
-    elif source.suffix != ".cue":
-        cue_file = source.with_suffix(".cue")
-        if cue_file.exists():
-            section_ranges = get_section_ranges(cue_file)
-            for index, section_range in enumerate(section_ranges):
-                output = source.with_name(f"{source.stem}_{index}.wav")
-                yield Operation(source, output, section_range)
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("path", nargs="?", type=Path, default=Path("vod"))
+    parser.add_argument("--separated", action="store_true")
+    parser.add_argument("--gpu", action="store_true")
+    args = parser.parse_args()
 
+    OUTPUT_FOLDER.mkdir(parents=True, exist_ok=True)
 
-parser = argparse.ArgumentParser()
-parser.add_argument("path", type=Path)
-parser.add_argument("--gpu", action="store_true")
-args = parser.parse_args()
+    if args.separated:
+        multi_source_operation = MultiSourceOperationResolver(
+            SEPARATED_FOLDER, OUTPUT_FOLDER
+        )()
+    else:
+        single_source_operation_output_list = list(
+            SingleSourceOperationExecutor(operation, args.gpu)()
+            for operation in SingelSourceOperationResolver(args.path)
+        )
+        multi_source_operation = MultiSourceOperation(
+            single_source_operation_output_list,
+            OUTPUT_FOLDER,
+        )
 
-OUTPUT_FOLDER.mkdir(parents=True, exist_ok=True)
-
-for operation in get_operations(args.path):
-    converted = extract_section(
-        operation.source, operation.section_output, operation.section_range
-    )
-    vocals = separate_vocals(converted, args.gpu)
-    silence_removed = remove_silence(vocals)
-    chunks = get_chunks(silence_removed)
-    splice(silence_removed, chunks)
+    MultiSourceOperationExecutor(multi_source_operation)()
