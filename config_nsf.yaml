@@ -26,7 +26,7 @@ datasets:
 debug: false
 dec_ffn_kernel_size: 9
 dec_layers: 4
-decay_steps: 40000
+decay_steps: 20000
 decoder_type: fft
 dict_dir: ''
 diff_decoder_type: wavenet
@@ -74,14 +74,14 @@ lambda_word_dur: 1.0
 load_ckpt: pretrain/base_44.1KHz_384_20_50k/model_ckpt_steps_50000.ckpt
 log_interval: 100
 loud_norm: false
-lr: 0.0012
+lr: 0.0002
 max_beta: 0.02
 max_epochs: 3000
 max_eval_sentences: 1
 max_eval_tokens: 60000
 max_frames: 42000
 max_input_tokens: 60000
-max_sentences: 88
+max_sentences: 12
 max_tokens: 128000
 max_updates: 1000000
 mel_loss: ssim:0.5|l1:0.5

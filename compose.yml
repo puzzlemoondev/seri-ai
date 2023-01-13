@@ -17,6 +17,7 @@ services:
     command: ["bash", "-l"]
     tty: true
     stdin_open: true
+    shm_size: 8gb
   diff-svc-cmd:
     extends: diff-svc
     entrypoint: ["bash", "-l", "-c"]
