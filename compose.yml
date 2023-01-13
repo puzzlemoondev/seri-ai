@@ -1,0 +1,33 @@
+services:
+  diff-svc:
+    image: puzzlemoondev/rocm-gfx803-diff-svc
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    security_opt:
+      - seccomp:unconfined
+    group_add:
+      - video
+    volumes:
+      - ./config_nsf.yaml:/home/rocm-user/diff-svc/training/config_nsf.yaml
+      - ./data:/home/rocm-user/diff-svc/data
+      - ./checkpoints/seri:/home/rocm-user/diff-svc/checkpoints/seri
+    environment:
+      - CUDA_VISIBLE_DEVICES=0
+    command: ["bash", "-l"]
+    tty: true
+    stdin_open: true
+  diff-svc-cmd:
+    extends: diff-svc
+    entrypoint: ["bash", "-l", "-c"]
+  preprocess:
+    extends: diff-svc-cmd
+    environment:
+      - PYTHONPATH=.
+    command: ["conda run -n gfx803 python preprocessing/binarize.py --config training/config_nsf.yaml"]
+  train:
+    extends: diff-svc-cmd
+    command: ["conda run -n gfx803 python run.py --config training/config_nsf.yaml --exp_name seri --reset"]
+  infer:
+    extends: diff-svc
+    entrypoint: ["bash", "-l", "-c", "conda run -n gfx803 python infer.py"]
