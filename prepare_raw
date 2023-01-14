@@ -15,8 +15,7 @@ from collections.abc import Iterable
 from tempfile import TemporaryDirectory
 from ffmpeg_normalize import FFmpegNormalize
 
-IDEAL_CHUNK_LENGTH = 8
-MIN_CHUNK_LENGTH = 5
+CHUNK_LENGTH = 8
 
 OUTPUT_FOLDER = Path("data/raw/seri")
 SEPARATED_FOLDER = Path("separated")
@@ -141,8 +140,7 @@ class MultiSourceOperationExecutor:
         normalized_list = self.normalize(source_list)
         concatenated = self.concatenate(normalized_list, "normalized")
         silence_removed = self.remove_silence(concatenated)
-        chunks = self.get_chunks(silence_removed)
-        self.splice(silence_removed, chunks)
+        self.splice(silence_removed)
 
     def normalize(self, source_list: list[Path]) -> list[Path]:
         output_list = [
@@ -150,7 +148,9 @@ class MultiSourceOperationExecutor:
             for index, source in enumerate(source_list)
         ]
 
-        normalizer = FFmpegNormalize(normalization_type="peak", output_format="wav")
+        normalizer = FFmpegNormalize(
+            normalization_type="peak", output_format="wav", debug=True
+        )
         for source, output in zip(source_list, output_list):
             normalizer.add_media_file(str(source), str(output))
         normalizer.run_normalization()
@@ -186,33 +186,21 @@ class MultiSourceOperationExecutor:
 
         return output
 
-    def get_chunks(self, source: Path) -> list[int]:
-        duration_output = subprocess.check_output(
-            ["./get_duration", source], encoding="utf-8"
-        )
-        duration = ceil(float(duration_output))
-
-        chunks = list(range(IDEAL_CHUNK_LENGTH, duration, IDEAL_CHUNK_LENGTH))
-        if (duration - chunks[-1]) < MIN_CHUNK_LENGTH:
-            chunks.pop()
-
-        return chunks
-
-    def splice(self, source: Path, chunks: list[int]):
+    def splice(self, source: Path):
         now = datetime.now().strftime("%Y%m%d")
+        batch_id = token_hex(3)
         output = self.operation.output_folder.joinpath(
-            f"{source.stem}_spliced_{now}_{token_hex(3)}_%06d.wav"
+            f"{source.stem}_spliced_{now}_{batch_id}_%06d.wav"
         )
 
         (
             ffmpeg.input(str(source))
-            .output(
-                str(output),
-                f="segment",
-                segment_times=",".join(map(str, chunks)),
-            )
+            .output(str(output), f="segment", segment_time=CHUNK_LENGTH)
             .run(overwrite_output=True)
         )
+
+        last_chunk = max(self.operation.output_folder.glob(f"*{batch_id}*.wav"))
+        last_chunk.unlink()  # remove last incomplete chunk
 
 
 if __name__ == "__main__":
