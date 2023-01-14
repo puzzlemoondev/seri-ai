@@ -30,7 +30,7 @@ class TimeRange:
 @dataclass
 class SingleSourceOperation:
     source: Path
-    section_output: Path
+    section_name: str
     section_range: Optional[TimeRange]
 
 
@@ -56,8 +56,8 @@ class SingelSourceOperationResolver:
             if cue_file.exists():
                 section_ranges = self.get_section_ranges(cue_file)
                 for index, section_range in enumerate(section_ranges):
-                    output = source.with_name(f"{source.stem}_{index}.wav")
-                    yield SingleSourceOperation(source, output, section_range)
+                    section_name = f"{source.stem}_{index}"
+                    yield SingleSourceOperation(source, section_name, section_range)
 
     def get_section_ranges(self, cue_file: Path) -> Iterable[TimeRange]:
         with open(cue_file) as f:
@@ -78,15 +78,28 @@ class MultiSourceOperationResolver:
         )
 
 
-class SingleSourceOperationExecutor:
+class WorkdirContext:
+    def __init__(self):
+        self._workdir = TemporaryDirectory()
+
+    @property
+    def workdir(self):
+        return Path(self._workdir.name)
+
+    def __del__(self):
+        self._workdir.cleanup()
+
+
+class SingleSourceOperationExecutor(WorkdirContext):
     def __init__(self, operation: SingleSourceOperation, use_gpu: bool):
+        super().__init__()
         self.operation = operation
         self.use_gpu = use_gpu
 
     def __call__(self) -> Path:
         section = self.extract_section(
             self.operation.source,
-            self.operation.section_output,
+            self.operation.section_name,
             self.operation.section_range,
         )
         vocals = self.separate_vocals(section)
@@ -94,8 +107,10 @@ class SingleSourceOperationExecutor:
         return vocals.resolve(strict=True)
 
     def extract_section(
-        self, source: Path, output: Path, section_range: Optional[TimeRange]
+        self, source: Path, section_name: str, section_range: Optional[TimeRange]
     ) -> Path:
+        output = self.workdir.joinpath(f"{section_name}.wav")
+
         section_args = dict()
         if section_range is not None:
             section_args.update(ss=section_range.start, to=section_range.end)
@@ -103,7 +118,7 @@ class SingleSourceOperationExecutor:
         (
             ffmpeg.input(str(source))
             .output(str(output), ac=2, ar=44100, format="wav", **section_args)
-            .run(overwrite_output=True)
+            .run()
         )
 
         return output
@@ -120,17 +135,10 @@ class SingleSourceOperationExecutor:
         return output
 
 
-class MultiSourceOperationExecutor:
+class MultiSourceOperationExecutor(WorkdirContext):
     def __init__(self, operation: MultiSourceOperation):
+        super().__init__()
         self.operation = operation
-        self.workdir = TemporaryDirectory()
-
-    @property
-    def workdir_path(self):
-        return Path(self.workdir.name)
-
-    def __del__(self):
-        self.workdir.cleanup()
 
     def __call__(self):
         source_list = self.operation.source_list
@@ -144,7 +152,7 @@ class MultiSourceOperationExecutor:
 
     def normalize(self, source_list: list[Path]) -> list[Path]:
         output_list = [
-            self.workdir_path.joinpath(f"normalized_{index}.wav")
+            self.workdir.joinpath(f"normalized_{index}.wav")
             for index, source in enumerate(source_list)
         ]
 
@@ -158,14 +166,10 @@ class MultiSourceOperationExecutor:
         return output_list
 
     def concatenate(self, source_list: list[Path], source_name: str) -> Path:
-        output = self.workdir_path.joinpath(f"{source_name}_concatenated.wav")
+        output = self.workdir.joinpath(f"{source_name}_concatenated.wav")
 
         inputs = (ffmpeg.input(str(source)) for source in source_list)
-        (
-            ffmpeg.concat(*inputs, v=0, a=1)
-            .output(str(output))
-            .run(overwrite_output=True)
-        )
+        ffmpeg.concat(*inputs, v=0, a=1).output(str(output)).run()
 
         return output
 
@@ -181,7 +185,7 @@ class MultiSourceOperationExecutor:
                 stop_threshold="-50dB",
             )
             .output(str(output))
-            .run(overwrite_output=True)
+            .run()
         )
 
         return output
@@ -196,7 +200,7 @@ class MultiSourceOperationExecutor:
         (
             ffmpeg.input(str(source))
             .output(str(output), f="segment", segment_time=CHUNK_LENGTH)
-            .run(overwrite_output=True)
+            .run()
         )
 
         last_chunk = max(self.operation.output_folder.glob(f"*{batch_id}*.wav"))
