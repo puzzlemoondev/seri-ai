@@ -15,9 +15,11 @@ services:
     environment:
       - CUDA_VISIBLE_DEVICES=0
     command: ["bash", "-l"]
+    shm_size: 8gb
+  diff-svc-tty:
+    extends: diff-svc
     tty: true
     stdin_open: true
-    shm_size: 8gb
   diff-svc-cmd:
     extends: diff-svc
     entrypoint: ["bash", "-l", "-c"]
@@ -25,10 +27,10 @@ services:
     extends: diff-svc-cmd
     environment:
       - PYTHONPATH=.
-    command: ["conda run -n gfx803 python preprocessing/binarize.py --config training/config_nsf.yaml"]
+    command: ["conda run --no-capture-output -n gfx803 python preprocessing/binarize.py --config training/config_nsf.yaml"]
   train:
     extends: diff-svc-cmd
-    command: ["conda run -n gfx803 python run.py --config training/config_nsf.yaml --exp_name seri --reset"]
+    command: ["conda run --no-capture-output -n gfx803 python run.py --config training/config_nsf.yaml --exp_name seri --reset"]
   infer:
     extends: diff-svc
-    entrypoint: ["bash", "-l", "-c", "conda run -n gfx803 python infer.py"]
+    entrypoint: ["bash", "-l", "-c", "conda run --no-capture-output -n gfx803 python infer.py"]
