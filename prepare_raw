@@ -106,7 +106,7 @@ class RawSourceOperationExecutor(WorkdirContext):
     def __call__(self) -> Path:
         section = self.extract_section(
             self.operation.source,
-            self.operation.section_name,
+            self.workdir.joinpath(f"{self.operation.section_name}.wav"),
             self.operation.section_range,
         )
         vocals = self.separate_vocals(section)
@@ -114,10 +114,8 @@ class RawSourceOperationExecutor(WorkdirContext):
         return vocals.resolve(strict=True)
 
     def extract_section(
-        self, source: Path, section_name: str, section_range: Optional[TimeRange]
+        self, source: Path, output: Path, section_range: Optional[TimeRange]
     ) -> Path:
-        output = self.workdir.joinpath(f"{section_name}.wav")
-
         section_args = dict()
         if section_range is not None:
             section_args.update(ss=section_range.start, to=section_range.end)
@@ -148,12 +146,18 @@ class SeparatedSourceOperationExecutor(WorkdirContext):
         self.operation = operation
 
     def __call__(self):
-        normalized = self.normalize(self.operation.source, self.operation.source_name)
-        silence_removed = self.remove_silence(normalized)
-        self.splice(silence_removed)
+        silence_removed = self.remove_silence(
+            self.operation.source,
+            self.workdir.joinpath(f"{self.operation.source_name}_normalized"),
+        )
+        normalized = self.normalize(
+            silence_removed,
+            silence_removed.with_stem(f"{silence_removed.stem}_silenceremoved"),
+        )
+        self.splice(normalized)
 
-    def normalize(self, source: Path, source_name: str) -> list[Path]:
-        output = self.workdir.joinpath(f"{source_name}_normalized")
+    def normalize(self, source: Path, output: Path) -> list[Path]:
+        output = self.workdir.joinpath(f"{source.stem}_normalized")
 
         normalizer = FFmpegNormalize(output_format="wav", debug=True)
         normalizer.add_media_file(str(source), str(output))
@@ -161,7 +165,7 @@ class SeparatedSourceOperationExecutor(WorkdirContext):
 
         return output
 
-    def remove_silence(self, source: Path) -> Path:
+    def remove_silence(self, source: Path, output: Path) -> Path:
         output = source.with_stem(f"{source.stem}_silenceremoved")
 
         (
