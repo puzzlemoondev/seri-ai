@@ -28,36 +28,37 @@ class TimeRange:
 
 
 @dataclass
-class SingleSourceOperation:
+class RawSourceOperation:
     source: Path
     section_name: str
     section_range: Optional[TimeRange]
 
 
 @dataclass
-class MultiSourceOperation:
-    source_list: list[Path]
+class SeparatedSourceOperation:
+    source: Path
+    source_name: str
     output_folder: Path
 
 
-class SingelSourceOperationResolver:
+class RawSourceOperationResolver:
     def __init__(self, path: Path):
         self.path = path
 
-    def __iter__(self) -> Iterable[SingleSourceOperation]:
+    def __iter__(self) -> Iterable[RawSourceOperation]:
         yield from self.get_operations(self.path)
 
-    def get_operations(self, source: Path) -> Iterable[SingleSourceOperation]:
-        if source.is_dir():
-            for child in source.iterdir():
+    def get_operations(self, path: Path) -> Iterable[RawSourceOperation]:
+        if path.is_dir():
+            for child in path.iterdir():
                 yield from self.get_operations(child)
-        elif source.suffix != ".cue":
-            cue_file = source.with_suffix(".cue")
+        elif path.suffix != ".cue":
+            cue_file = path.with_suffix(".cue")
             if cue_file.exists():
                 section_ranges = self.get_section_ranges(cue_file)
                 for index, section_range in enumerate(section_ranges):
-                    section_name = f"{source.stem}_{index}"
-                    yield SingleSourceOperation(source, section_name, section_range)
+                    section_name = f"{path.stem}_{index}"
+                    yield RawSourceOperation(path, section_name, section_range)
 
     def get_section_ranges(self, cue_file: Path) -> Iterable[TimeRange]:
         with open(cue_file) as f:
@@ -67,15 +68,21 @@ class SingelSourceOperationResolver:
                     yield TimeRange(timestamps[0], timestamps[1])
 
 
-class MultiSourceOperationResolver:
+class SeparatedSourceOperationResolver:
     def __init__(self, path: Path, output_folder: Path):
         self.path = path.resolve(strict=True)
         self.output_folder = output_folder
 
-    def __call__(self) -> MultiSourceOperation:
-        return MultiSourceOperation(
-            list(self.path.glob(f"**/vocals.wav")), self.output_folder
-        )
+    def __iter__(self) -> Iterable[SeparatedSourceOperation]:
+        for source in self.get_sources(self.path):
+            yield SeparatedSourceOperation(source, self.output_folder)
+
+    def get_operations(self, path: Path):
+        if path.is_dir():
+            for child in path.iterdir():
+                yield from self.get_operations(child)
+        elif path.name == "vocals.wav":
+            yield SeparatedSourceOperation(path, path.parent.name, self.output_folder)
 
 
 class WorkdirContext:
@@ -90,8 +97,8 @@ class WorkdirContext:
         self._workdir.cleanup()
 
 
-class SingleSourceOperationExecutor(WorkdirContext):
-    def __init__(self, operation: SingleSourceOperation, use_gpu: bool):
+class RawSourceOperationExecutor(WorkdirContext):
+    def __init__(self, operation: RawSourceOperation, use_gpu: bool):
         super().__init__()
         self.operation = operation
         self.use_gpu = use_gpu
@@ -135,41 +142,22 @@ class SingleSourceOperationExecutor(WorkdirContext):
         return output
 
 
-class MultiSourceOperationExecutor(WorkdirContext):
-    def __init__(self, operation: MultiSourceOperation):
+class SeparatedSourceOperationExecutor(WorkdirContext):
+    def __init__(self, operation: SeparatedSourceOperation):
         super().__init__()
         self.operation = operation
 
     def __call__(self):
-        source_list = self.operation.source_list
-        if not source_list:
-            return
-
-        normalized_list = self.normalize(source_list)
-        concatenated = self.concatenate(normalized_list, "normalized")
-        silence_removed = self.remove_silence(concatenated)
+        normalized = self.normalize(self.operation.source, self.operation.source_name)
+        silence_removed = self.remove_silence(normalized)
         self.splice(silence_removed)
 
-    def normalize(self, source_list: list[Path]) -> list[Path]:
-        output_list = [
-            self.workdir.joinpath(f"normalized_{index}.wav")
-            for index, source in enumerate(source_list)
-        ]
+    def normalize(self, source: Path, source_name: str) -> list[Path]:
+        output = self.workdir.joinpath(f"{source_name}_normalized")
 
-        normalizer = FFmpegNormalize(
-            normalization_type="peak", output_format="wav", debug=True
-        )
-        for source, output in zip(source_list, output_list):
-            normalizer.add_media_file(str(source), str(output))
+        normalizer = FFmpegNormalize(output_format="wav", debug=True)
+        normalizer.add_media_file(str(source), str(output))
         normalizer.run_normalization()
-
-        return output_list
-
-    def concatenate(self, source_list: list[Path], source_name: str) -> Path:
-        output = self.workdir.joinpath(f"{source_name}_concatenated.wav")
-
-        inputs = (ffmpeg.input(str(source)) for source in source_list)
-        ffmpeg.concat(*inputs, v=0, a=1).output(str(output)).run()
 
         return output
 
@@ -207,6 +195,18 @@ class MultiSourceOperationExecutor(WorkdirContext):
         last_chunk.unlink()  # remove last incomplete chunk
 
 
+def run_raw(path: Path, use_gpu: bool) -> Path:
+    for operation in RawSourceOperationResolver(path):
+        executor = RawSourceOperationExecutor(operation, use_gpu)
+        yield executor()
+
+
+def run_separated(path: Path):
+    for operation in SeparatedSourceOperationResolver(source, OUTPUT_FOLDER):
+        executor = SeparatedSourceOperationExecutor(operation)
+        yield executor()
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("path", nargs="?", type=Path, default=Path("vod"))
@@ -216,18 +216,8 @@ if __name__ == "__main__":
 
     OUTPUT_FOLDER.mkdir(parents=True, exist_ok=True)
 
-    if args.separated:
-        multi_source_operation = MultiSourceOperationResolver(
-            SEPARATED_FOLDER, OUTPUT_FOLDER
-        )()
-    else:
-        single_source_operation_output_list = list(
-            SingleSourceOperationExecutor(operation, args.gpu)()
-            for operation in SingelSourceOperationResolver(args.path)
-        )
-        multi_source_operation = MultiSourceOperation(
-            single_source_operation_output_list,
-            OUTPUT_FOLDER,
-        )
+    raw_results = (
+        list(run_raw(args.path, args.gpu)) if not args.separated else [SEPARATED_FOLDER]
+    )
 
-    MultiSourceOperationExecutor(multi_source_operation)()
+    separated_results = [run_separated(path) for path in raw_results]
