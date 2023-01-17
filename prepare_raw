@@ -1,37 +1,36 @@
 #!/usr/bin/env python3
 
-import os
-import ffmpeg
 import argparse
 import subprocess
 
-from math import ceil
 from pathlib import Path
-from typing import Optional
+from operator import add
+from itertools import chain
+from functools import reduce
 from secrets import token_hex
 from datetime import datetime
+from pydub import AudioSegment, silence
 from dataclasses import dataclass
 from collections.abc import Iterable
 from tempfile import TemporaryDirectory
 from ffmpeg_normalize import FFmpegNormalize
 
 CHUNK_LENGTH = 8
-
 OUTPUT_FOLDER = Path("data/raw/seri")
 SEPARATED_FOLDER = Path("separated")
 
 
 @dataclass
 class TimeRange:
-    start: str
-    end: str
+    start_ms: int
+    end_ms: int
 
 
 @dataclass
 class RawSourceOperation:
     source: Path
     section_name: str
-    section_range: Optional[TimeRange]
+    section_range: TimeRange
 
 
 @dataclass
@@ -61,11 +60,17 @@ class RawSourceOperationResolver:
                     yield RawSourceOperation(path, section_name, section_range)
 
     def get_section_ranges(self, cue_file: Path) -> Iterable[TimeRange]:
+        def timestamp_to_milliseconds(timestamp):
+            hours, minutes, seconds = map(int, timestamp.split(":"))
+            total_seconds = hours * 3600 + minutes * 60 + seconds
+            return total_seconds * 1000
+
         with open(cue_file) as f:
             for line in f:
                 timestamps = line.strip().split("-")
                 if len(timestamps) == 2:
-                    yield TimeRange(timestamps[0], timestamps[1])
+                    start_ms, end_ms = map(timestamp_to_milliseconds, timestamps)
+                    yield TimeRange(start_ms, end_ms)
 
 
 class SeparatedSourceOperationResolver:
@@ -74,8 +79,7 @@ class SeparatedSourceOperationResolver:
         self.output_folder = output_folder
 
     def __iter__(self) -> Iterable[SeparatedSourceOperation]:
-        for source in self.get_sources(self.path):
-            yield SeparatedSourceOperation(source, self.output_folder)
+        yield from self.get_operations(self.path)
 
     def get_operations(self, path: Path):
         if path.is_dir():
@@ -111,31 +115,26 @@ class RawSourceOperationExecutor(WorkdirContext):
         )
         vocals = self.separate_vocals(section)
 
-        return vocals.resolve(strict=True)
+        return vocals
 
     def extract_section(
-        self, source: Path, output: Path, section_range: Optional[TimeRange]
+        self, source: Path, output: Path, section_range: TimeRange
     ) -> Path:
-        section_args = dict()
-        if section_range is not None:
-            section_args.update(ss=section_range.start, to=section_range.end)
-
         (
-            ffmpeg.input(str(source))
-            .output(str(output), ac=2, ar=44100, format="wav", **section_args)
-            .run()
+            AudioSegment.from_file(source)[
+                section_range.start_ms : section_range.end_ms
+            ]
+            .set_channels(2)
+            .set_frame_rate(44100)
+            .export(output, format="wav")
         )
 
         return output
 
-    def separate_vocals(self, file: Path) -> Path:
-        vocal_separarion_args = ["./separate_vocals", file]
-        if self.use_gpu:
-            vocal_separarion_args.insert(1, "--gpu")
+    def separate_vocals(self, source: Path) -> Path:
+        subprocess.run(["./separate_vocals", source], check=True)
 
-        subprocess.run(vocal_separarion_args, check=True)
-
-        output = next(SEPARATED_FOLDER.glob(f"**/{file.stem}/vocals.wav"))
+        output = next(SEPARATED_FOLDER.glob(f"**/{source.stem}/vocals.wav"))
 
         return output
 
@@ -148,55 +147,59 @@ class SeparatedSourceOperationExecutor(WorkdirContext):
     def __call__(self):
         silence_removed = self.remove_silence(
             self.operation.source,
-            self.workdir.joinpath(f"{self.operation.source_name}_normalized"),
+            self.workdir.joinpath(f"{self.operation.source_name}_normalized.wav"),
         )
         normalized = self.normalize(
             silence_removed,
             silence_removed.with_stem(f"{silence_removed.stem}_silenceremoved"),
         )
-        self.splice(normalized)
+        spliced = self.splice(normalized)
 
-    def normalize(self, source: Path, output: Path) -> list[Path]:
-        output = self.workdir.joinpath(f"{source.stem}_normalized")
+        return spliced
 
-        normalizer = FFmpegNormalize(output_format="wav", debug=True)
+    def remove_silence(self, source: Path, output: Path) -> Path:
+        (
+            reduce(
+                add,
+                silence.split_on_silence(
+                    AudioSegment.from_wav(source), silence_thresh=-50
+                ),
+                AudioSegment.empty(),
+            ).export(output, format="wav")
+        )
+
+        return output
+
+    def normalize(self, source: Path, output: Path) -> Path:
+        normalizer = FFmpegNormalize(
+            print_stats=True,
+            keep_loudness_range_target=True,
+            output_format="wav",
+            debug=True,
+        )
         normalizer.add_media_file(str(source), str(output))
         normalizer.run_normalization()
 
         return output
 
-    def remove_silence(self, source: Path, output: Path) -> Path:
-        output = source.with_stem(f"{source.stem}_silenceremoved")
-
-        (
-            ffmpeg.input(str(source))
-            .filter(
-                "silenceremove",
-                stop_periods=-1,
-                stop_duration=1,
-                stop_threshold="-50dB",
-            )
-            .output(str(output))
-            .run()
+    def splice(self, source: Path) -> list[Path]:
+        chunk_length_ms = CHUNK_LENGTH * 1000
+        chunks = filter(
+            lambda chunk: len(chunk) == chunk_length_ms,
+            AudioSegment.from_wav(source)[::chunk_length_ms],
         )
 
-        return output
-
-    def splice(self, source: Path):
-        now = datetime.now().strftime("%Y%m%d")
+        today = datetime.now().strftime("%Y%m%d")
         batch_id = token_hex(3)
-        output = self.operation.output_folder.joinpath(
-            f"{source.stem}_spliced_{now}_{batch_id}_%06d.wav"
-        )
 
-        (
-            ffmpeg.input(str(source))
-            .output(str(output), f="segment", segment_time=CHUNK_LENGTH)
-            .run()
-        )
+        def export(index, chunk):
+            output = self.operation.output_folder.joinpath(
+                f"{source.stem}_spliced_{today}_{batch_id}_{index}.wav"
+            )
+            chunk.export(output, format="wav")
+            return output
 
-        last_chunk = max(self.operation.output_folder.glob(f"*{batch_id}*.wav"))
-        last_chunk.unlink()  # remove last incomplete chunk
+        return [export(index, chunk) for index, chunk in enumerate(chunks)]
 
 
 def run_raw(path: Path, use_gpu: bool) -> Path:
@@ -206,7 +209,7 @@ def run_raw(path: Path, use_gpu: bool) -> Path:
 
 
 def run_separated(path: Path):
-    for operation in SeparatedSourceOperationResolver(source, OUTPUT_FOLDER):
+    for operation in SeparatedSourceOperationResolver(path, OUTPUT_FOLDER):
         executor = SeparatedSourceOperationExecutor(operation)
         yield executor()
 
@@ -220,8 +223,13 @@ if __name__ == "__main__":
 
     OUTPUT_FOLDER.mkdir(parents=True, exist_ok=True)
 
-    raw_results = (
-        list(run_raw(args.path, args.gpu)) if not args.separated else [SEPARATED_FOLDER]
-    )
+    raw_results = None
+    if args.separated:
+        raw_results = [SEPARATED_FOLDER]
+    else:
+        raw_results = run_raw(args.path, args.gpu)
 
-    separated_results = [run_separated(path) for path in raw_results]
+    for raw_path in raw_results:
+        for separated_result in run_separated(raw_path):
+            for separated_path in separated_result:
+                print(f"{raw_path} output: {separated_path}")
