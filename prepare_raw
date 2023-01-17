@@ -43,7 +43,7 @@ class SeparatedSourceOperation:
 
 class RawSourceOperationResolver:
     def __init__(self, path: Path):
-        self.path = path
+        self.path = path.resolve(strict=True)
 
     def __iter__(self) -> Iterable[RawSourceOperation]:
         yield from self.get_operations(self.path)
