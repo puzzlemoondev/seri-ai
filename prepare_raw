@@ -147,11 +147,11 @@ class SeparatedSourceOperationExecutor(WorkdirContext):
     def __call__(self):
         silence_removed = self.remove_silence(
             self.operation.source,
-            self.workdir.joinpath(f"{self.operation.source_name}_normalized.wav"),
+            self.workdir.joinpath(f"{self.operation.source_name}_silenceremoved.wav"),
         )
         normalized = self.normalize(
             silence_removed,
-            silence_removed.with_stem(f"{silence_removed.stem}_silenceremoved"),
+            silence_removed.with_stem(f"{silence_removed.stem}_normalized"),
         )
         spliced = self.splice(normalized)
 
