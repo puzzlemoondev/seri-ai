@@ -230,6 +230,7 @@ if __name__ == "__main__":
         raw_results = run_raw(args.path, args.gpu)
 
     for raw_path in raw_results:
+        print(f"{args.path} output: {raw_path}")
         for separated_result in run_separated(raw_path):
             for separated_path in separated_result:
                 print(f"{raw_path} output: {separated_path}")
