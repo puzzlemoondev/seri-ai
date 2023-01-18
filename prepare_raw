@@ -10,11 +10,11 @@ from itertools import chain
 from functools import reduce
 from secrets import token_hex
 from datetime import datetime
-from pydub import AudioSegment, silence
 from dataclasses import dataclass
 from collections.abc import Iterable
 from tempfile import TemporaryDirectory
 from ffmpeg_normalize import FFmpegNormalize
+from pydub import AudioSegment, effects, silence
 
 CHUNK_LENGTH = 8
 OUTPUT_FOLDER = Path("data/raw/seri")
@@ -162,9 +162,13 @@ class SeparatedSourceOperationExecutor(WorkdirContext):
             self.operation.source,
             self.workdir.joinpath(f"{self.operation.source_name}_silenceremoved.wav"),
         )
-        normalized = self.normalize(
+        compressed = self.compress(
             silence_removed,
-            silence_removed.with_stem(f"{silence_removed.stem}_normalized"),
+            silence_removed.with_stem(f"{silence_removed.stem}_compressed"),
+        )
+        normalized = self.normalize(
+            compressed,
+            compressed.with_stem(f"{compressed.stem}_normalized"),
         )
         spliced = self.splice(normalized)
 
@@ -179,6 +183,13 @@ class SeparatedSourceOperationExecutor(WorkdirContext):
                 ),
                 AudioSegment.empty(),
             ).export(output, format="wav")
+        )
+
+        return output
+
+    def compress(self, source: Path, output: Path) -> Path:
+        effects.compress_dynamic_range(AudioSegment.from_wav(source)).export(
+            output, format="wav"
         )
 
         return output
@@ -229,23 +240,47 @@ def run_separated(path: Path):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("path", nargs="?", type=Path, default=Path("vod"))
-    parser.add_argument("--separate-only", action="store_true")
-    parser.add_argument("--separated", action="store_true")
-    parser.add_argument("--no-cue", action="store_true")
-    parser.add_argument("--gpu", action="store_true")
+    parser.add_argument(
+        "path",
+        nargs="?",
+        type=Path,
+        default=Path("vod"),
+        help="file or directory to process",
+    )
+    parser.add_argument(
+        "--gpu", action="store_true", help="use gpu in vocal separation"
+    )
+    parser.add_argument(
+        "--no-cue",
+        action="store_true",
+        help="ignore cue file; processing will run on whole file",
+    )
+    parser.add_argument(
+        "--skip-separate", action="store_true", help="skip vocal separation"
+    )
+    parser.add_argument(
+        "--separate-only", action="store_true", help="run vocal separation only"
+    )
+    parser.add_argument(
+        "--separate-single",
+        action="store_true",
+        help="separate single file; equivalent to --no-cue and --skip-separate",
+    )
     args = parser.parse_args()
+
+    if args.separate_single:
+        args.no_cue = True
+        args.separate_only = True
 
     OUTPUT_FOLDER.mkdir(parents=True, exist_ok=True)
 
     raw_results = None
-    if args.separated:
+    if args.skip_separate:
         raw_results = [SEPARATED_FOLDER]
     else:
         raw_results = run_raw(args.path, not args.no_cue, args.gpu)
 
     for raw_path in raw_results:
-        print(f"{args.path} output: {raw_path}")
         if not args.separate_only:
             for separated_result in run_separated(raw_path):
                 for separated_path in separated_result:
