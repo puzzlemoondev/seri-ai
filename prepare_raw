@@ -5,6 +5,7 @@ import subprocess
 
 from pathlib import Path
 from operator import add
+from typing import Optional
 from itertools import chain
 from functools import reduce
 from secrets import token_hex
@@ -30,7 +31,7 @@ class TimeRange:
 class RawSourceOperation:
     source: Path
     section_name: str
-    section_range: TimeRange
+    section_range: Optional[TimeRange]
 
 
 @dataclass
@@ -41,8 +42,9 @@ class SeparatedSourceOperation:
 
 
 class RawSourceOperationResolver:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, use_cue: bool):
         self.path = path.resolve(strict=True)
+        self.use_cue = use_cue
 
     def __iter__(self) -> Iterable[RawSourceOperation]:
         yield from self.get_operations(self.path)
@@ -52,12 +54,15 @@ class RawSourceOperationResolver:
             for child in path.iterdir():
                 yield from self.get_operations(child)
         elif path.suffix != ".cue":
-            cue_file = path.with_suffix(".cue")
-            if cue_file.exists():
-                section_ranges = self.get_section_ranges(cue_file)
-                for index, section_range in enumerate(section_ranges):
-                    section_name = f"{path.stem}_{index}"
-                    yield RawSourceOperation(path, section_name, section_range)
+            if self.use_cue:
+                cue_file = path.with_suffix(".cue")
+                if cue_file.exists():
+                    section_ranges = self.get_section_ranges(cue_file)
+                    for index, section_range in enumerate(section_ranges):
+                        section_name = f"{path.stem}_{index}"
+                        yield RawSourceOperation(path, section_name, section_range)
+            else:
+                yield RawSourceOperation(path, path.stem, None)
 
     def get_section_ranges(self, cue_file: Path) -> Iterable[TimeRange]:
         def timestamp_to_milliseconds(timestamp):
@@ -118,12 +123,16 @@ class RawSourceOperationExecutor(WorkdirContext):
         return vocals
 
     def extract_section(
-        self, source: Path, output: Path, section_range: TimeRange
+        self, source: Path, output: Path, section_range: Optional[TimeRange]
     ) -> Path:
+        segment = AudioSegment.from_file(source)
+
         (
-            AudioSegment.from_file(source)[
-                section_range.start_ms : section_range.end_ms
-            ]
+            (
+                segment[section_range.start_ms : section_range.end_ms]
+                if section_range is not None
+                else segment
+            )
             .set_channels(2)
             .set_frame_rate(44100)
             .export(output, format="wav")
@@ -132,7 +141,11 @@ class RawSourceOperationExecutor(WorkdirContext):
         return output
 
     def separate_vocals(self, source: Path) -> Path:
-        subprocess.run(["./separate_vocals", source], check=True)
+        demucs_args = ["demucs", "--two-stems=vocals", source]
+        if not self.use_gpu:
+            demucs_args[1:1] = ["-d", "cpu"]
+
+        subprocess.run(demucs_args, check=True)
 
         output = next(SEPARATED_FOLDER.glob(f"**/{source.stem}/vocals.wav"))
 
@@ -202,8 +215,8 @@ class SeparatedSourceOperationExecutor(WorkdirContext):
         return [export(index, chunk) for index, chunk in enumerate(chunks)]
 
 
-def run_raw(path: Path, use_gpu: bool) -> Path:
-    for operation in RawSourceOperationResolver(path):
+def run_raw(path: Path, use_cue: bool, use_gpu: bool) -> Path:
+    for operation in RawSourceOperationResolver(path, use_cue):
         executor = RawSourceOperationExecutor(operation, use_gpu)
         yield executor()
 
@@ -217,7 +230,9 @@ def run_separated(path: Path):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("path", nargs="?", type=Path, default=Path("vod"))
+    parser.add_argument("--separate-only", action="store_true")
     parser.add_argument("--separated", action="store_true")
+    parser.add_argument("--no-cue", action="store_true")
     parser.add_argument("--gpu", action="store_true")
     args = parser.parse_args()
 
@@ -227,10 +242,11 @@ if __name__ == "__main__":
     if args.separated:
         raw_results = [SEPARATED_FOLDER]
     else:
-        raw_results = run_raw(args.path, args.gpu)
+        raw_results = run_raw(args.path, not args.no_cue, args.gpu)
 
     for raw_path in raw_results:
         print(f"{args.path} output: {raw_path}")
-        for separated_result in run_separated(raw_path):
-            for separated_path in separated_result:
-                print(f"{raw_path} output: {separated_path}")
+        if not args.separate_only:
+            for separated_result in run_separated(raw_path):
+                for separated_path in separated_result:
+                    print(f"{raw_path} output: {separated_path}")
