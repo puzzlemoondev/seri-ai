@@ -264,7 +264,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--separate-single",
         action="store_true",
-        help="separate single file; equivalent to --no-cue and --skip-separate",
+        help="separate single file; equivalent to --no-cue and --separate-only",
     )
     args = parser.parse_args()
 
