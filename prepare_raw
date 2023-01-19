@@ -128,15 +128,10 @@ class RawSourceOperationExecutor(WorkdirContext):
         segment = AudioSegment.from_file(source)
 
         (
-            (
-                segment[section_range.start_ms : section_range.end_ms]
-                if section_range is not None
-                else segment
-            )
-            .set_channels(2)
-            .set_frame_rate(44100)
-            .export(output, format="wav")
-        )
+            segment[section_range.start_ms : section_range.end_ms]
+            if section_range is not None
+            else segment
+        ).export(output, format="wav")
 
         return output
 
@@ -171,8 +166,12 @@ class SeparatedSourceOperationExecutor(WorkdirContext):
             compressed.with_stem(f"{compressed.stem}_normalized"),
         )
         spliced = self.splice(normalized)
+        mono = [
+            self.convert_to_mono(source, source.with_stem(f"{source.stem}_mono"))
+            for source in spliced
+        ]
 
-        return spliced
+        return mono
 
     def remove_silence(self, source: Path, output: Path) -> Path:
         (
@@ -206,7 +205,7 @@ class SeparatedSourceOperationExecutor(WorkdirContext):
 
         return output
 
-    def splice(self, source: Path) -> list[Path]:
+    def splice(self, source: Path) -> Iterable[Path]:
         chunk_length_ms = CHUNK_LENGTH * 1000
         chunks = filter(
             lambda chunk: len(chunk) == chunk_length_ms,
@@ -215,15 +214,23 @@ class SeparatedSourceOperationExecutor(WorkdirContext):
 
         today = datetime.now().strftime("%Y%m%d")
         batch_id = token_hex(3)
-
-        def export(index, chunk):
+        for index, chunk in enumerate(chunks):
             output = self.operation.output_folder.joinpath(
                 f"{source.stem}_spliced_{today}_{batch_id}_{index}.wav"
             )
             chunk.export(output, format="wav")
-            return output
+            yield output
 
-        return [export(index, chunk) for index, chunk in enumerate(chunks)]
+    def convert_to_mono(self, source: Path, output: Path) -> Path:
+        (
+            AudioSegment.from_wav(source)
+            .set_channels(1)
+            .set_sample_width(2)
+            .set_frame_rate(44100)
+            .export(output, format="wav")
+        )
+
+        return output
 
 
 def run_raw(path: Path, use_cue: bool, use_gpu: bool) -> Path:
