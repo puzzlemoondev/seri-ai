@@ -2,6 +2,7 @@
 
 import argparse
 import subprocess
+import multiprocessing
 
 from pathlib import Path
 from operator import add
@@ -94,28 +95,16 @@ class SeparatedSourceOperationResolver:
             yield SeparatedSourceOperation(path, path.parent.name, self.output_folder)
 
 
-class WorkdirContext:
-    def __init__(self):
-        self._workdir = TemporaryDirectory()
-
-    @property
-    def workdir(self):
-        return Path(self._workdir.name)
-
-    def __del__(self):
-        self._workdir.cleanup()
-
-
-class RawSourceOperationExecutor(WorkdirContext):
+class RawSourceOperationExecutor:
     def __init__(self, operation: RawSourceOperation, use_gpu: bool):
         super().__init__()
         self.operation = operation
         self.use_gpu = use_gpu
 
-    def __call__(self) -> Path:
+    def __call__(self, workdir: Path) -> Path:
         section = self.extract_section(
             self.operation.source,
-            self.workdir.joinpath(f"{self.operation.section_name}.wav"),
+            workdir.joinpath(f"{self.operation.section_name}.wav"),
             self.operation.section_range,
         )
         vocals = self.separate_vocals(section)
@@ -147,15 +136,15 @@ class RawSourceOperationExecutor(WorkdirContext):
         return output
 
 
-class SeparatedSourceOperationExecutor(WorkdirContext):
+class SeparatedSourceOperationExecutor:
     def __init__(self, operation: SeparatedSourceOperation):
         super().__init__()
         self.operation = operation
 
-    def __call__(self):
+    def __call__(self, workdir: Path) -> list[Path]:
         silence_removed = self.remove_silence(
             self.operation.source,
-            self.workdir.joinpath(f"{self.operation.source_name}_silenceremoved.wav"),
+            workdir.joinpath(f"{self.operation.source_name}_silenceremoved.wav"),
         )
         compressed = self.compress(
             silence_removed,
@@ -165,13 +154,12 @@ class SeparatedSourceOperationExecutor(WorkdirContext):
             compressed,
             compressed.with_stem(f"{compressed.stem}_normalized"),
         )
-        spliced = self.splice(normalized)
-        mono = [
-            self.convert_to_mono(source, source.with_stem(f"{source.stem}_mono"))
-            for source in spliced
-        ]
+        mono = self.convert_to_mono(
+            normalized, normalized.with_stem(f"{normalized.stem}_mono")
+        )
+        spliced = self.splice(mono)
 
-        return mono
+        return list(spliced)
 
     def remove_silence(self, source: Path, output: Path) -> Path:
         (
@@ -205,6 +193,17 @@ class SeparatedSourceOperationExecutor(WorkdirContext):
 
         return output
 
+    def convert_to_mono(self, source: Path, output: Path) -> Path:
+        (
+            AudioSegment.from_wav(source)
+            .set_channels(1)
+            .set_sample_width(2)
+            .set_frame_rate(44100)
+            .export(output, format="wav")
+        )
+
+        return output
+
     def splice(self, source: Path) -> Iterable[Path]:
         chunk_length_ms = CHUNK_LENGTH * 1000
         chunks = filter(
@@ -221,28 +220,32 @@ class SeparatedSourceOperationExecutor(WorkdirContext):
             chunk.export(output, format="wav")
             yield output
 
-    def convert_to_mono(self, source: Path, output: Path) -> Path:
-        (
-            AudioSegment.from_wav(source)
-            .set_channels(1)
-            .set_sample_width(2)
-            .set_frame_rate(44100)
-            .export(output, format="wav")
-        )
 
-        return output
-
-
-def run_raw(path: Path, use_cue: bool, use_gpu: bool) -> Path:
+def get_raw_executor(
+    path: Path, use_cue: bool, use_gpu: bool
+) -> Iterable[RawSourceOperationExecutor]:
     for operation in RawSourceOperationResolver(path, use_cue):
         executor = RawSourceOperationExecutor(operation, use_gpu)
-        yield executor()
+        yield executor
 
 
-def run_separated(path: Path):
+def handle_raw_executor(executor: RawSourceOperationExecutor) -> Path:
+    with TemporaryDirectory() as workdir:
+        result = executor(workdir)
+        return result
+
+
+def get_separated_executor(path: Path) -> Iterable[SeparatedSourceOperationExecutor]:
     for operation in SeparatedSourceOperationResolver(path, OUTPUT_FOLDER):
         executor = SeparatedSourceOperationExecutor(operation)
-        yield executor()
+        yield executor
+
+
+def handle_separated_executor(executor: SeparatedSourceOperationExecutor):
+    workdir = Path(multiprocessing.util.get_temp_dir())
+    result = executor(workdir)
+    for separated_path in result:
+        print(f"output: {separated_path}")
 
 
 if __name__ == "__main__":
@@ -281,14 +284,18 @@ if __name__ == "__main__":
 
     OUTPUT_FOLDER.mkdir(parents=True, exist_ok=True)
 
-    raw_results = None
     if args.skip_separate:
         raw_results = [SEPARATED_FOLDER]
     else:
-        raw_results = run_raw(args.path, not args.no_cue, args.gpu)
+        raw_results = map(
+            handle_raw_executor,
+            get_raw_executor(args.path, not args.no_cue, args.gpu),
+        )
 
     for raw_path in raw_results:
         if not args.separate_only:
-            for separated_result in run_separated(raw_path):
-                for separated_path in separated_result:
-                    print(f"{raw_path} output: {separated_path}")
+            with multiprocessing.Pool() as p:
+                p.map(
+                    handle_separated_executor,
+                    get_separated_executor(raw_path),
+                )
