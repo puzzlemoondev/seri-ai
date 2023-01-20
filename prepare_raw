@@ -1,71 +1,143 @@
 #!/usr/bin/env python3
 
 import argparse
-import subprocess
 import multiprocessing
-
-from pathlib import Path
-from operator import add
-from typing import Optional
-from itertools import chain
-from functools import reduce
-from secrets import token_hex
-from datetime import datetime
-from dataclasses import dataclass
+import os
+import shutil
+import subprocess
 from collections.abc import Iterable
+from dataclasses import dataclass
+from datetime import datetime
+from enum import Enum
+from functools import lru_cache, total_ordering, reduce, partial
+from operator import add
+from pathlib import Path
+from secrets import token_hex
 from tempfile import TemporaryDirectory
+from typing import Optional, Tuple
+
 from ffmpeg_normalize import FFmpegNormalize
 from pydub import AudioSegment, effects, silence
 
-CHUNK_LENGTH = 8
-OUTPUT_FOLDER = Path("data/raw/seri")
+if shutil.which("ffmpeg") is None:
+    raise FileNotFoundError("ffmpeg not found")
+
+DEFAULT_INPUT_FOLDER = Path("vod")
+DEFAULT_OUTPUT_FOLDER = Path("data/raw/seri")
+DEFAULT_CHUNK_LENGTH = 8
 SEPARATED_FOLDER = Path("separated")
 
 
+class Logger:
+    def __init__(self):
+        self.session = token_hex(3)
+        self.logged = False
+
+    def log(self, *content):
+        self.print_session()
+        print(*content, f"({self.session})")
+
+    def print_session(self):
+        if not self.logged:
+            print(f"session {self.session}")
+            self.logged = True
+
+
+log = Logger().log
+
+
+@total_ordering
+class OrderedEnum(Enum):
+    @classmethod
+    @lru_cache(None)
+    def _member_list(cls):
+        return list(cls)
+
+    def __lt__(self, other):
+        if self.__class__ is other.__class__:
+            member_list = self.__class__._member_list()
+            return member_list.index(self) < member_list.index(other)
+        return NotImplemented
+
+
+class Action(OrderedEnum):
+    EXTRACT = "extract"
+    SEPARATE = "separate"
+    REMOVE_SILENCE = "remove_silence"
+    COMPRESS = "compress"
+    NORMALIZE = "normalize"
+    MONO = "mono"
+    SPLIT = "split"
+
+    def __str__(self):
+        return self.value
+
+    @classmethod
+    def raw_actions(cls):
+        return [Action.EXTRACT, Action.SEPARATE]
+
+    @classmethod
+    def separated_actions(cls):
+        excluded = cls.raw_actions()
+        return sorted(filter(lambda action: action not in excluded, Action))
+
+
 @dataclass
-class TimeRange:
+class Section:
+    index: int
     start_ms: int
     end_ms: int
 
 
 @dataclass
 class RawSourceOperation:
+    actions: list[Action]
     source: Path
-    section_name: str
-    section_range: Optional[TimeRange]
+    output_dir: Path
+    section: Optional[Section]
 
 
 @dataclass
 class SeparatedSourceOperation:
+    actions: list[Action]
     source: Path
     source_name: str
-    output_folder: Path
+    output_dir: Path
 
 
 class RawSourceOperationResolver:
-    def __init__(self, path: Path, use_cue: bool):
+    def __init__(self, path: Path, output_dir: Path, actions: list[Action]):
         self.path = path.resolve(strict=True)
-        self.use_cue = use_cue
+        self.output_dir = output_dir
+        self.actions = actions
 
     def __iter__(self) -> Iterable[RawSourceOperation]:
         yield from self.get_operations(self.path)
 
-    def get_operations(self, path: Path) -> Iterable[RawSourceOperation]:
+    def get_operations(self, path) -> Iterable[RawSourceOperation]:
+        actions = self.get_actions()
         if path.is_dir():
-            for child in path.iterdir():
+            for child in self.path.iterdir():
                 yield from self.get_operations(child)
         elif path.suffix != ".cue":
-            if self.use_cue:
-                cue_file = path.with_suffix(".cue")
-                if cue_file.exists():
-                    section_ranges = self.get_section_ranges(cue_file)
-                    for index, section_range in enumerate(section_ranges):
-                        section_name = f"{path.stem}_{index}"
-                        yield RawSourceOperation(path, section_name, section_range)
-            else:
-                yield RawSourceOperation(path, path.stem, None)
+            if Action.EXTRACT not in actions:
+                yield RawSourceOperation(actions, path, self.output_dir, None)
+                return
 
-    def get_section_ranges(self, cue_file: Path) -> Iterable[TimeRange]:
+            cue_file = path.with_suffix(".cue")
+            if not cue_file.exists():
+                return
+
+            section_ranges = self.get_section_ranges(cue_file)
+            for index, time_range in enumerate(section_ranges):
+                yield RawSourceOperation(actions, path, self.output_dir, Section(index, *time_range))
+
+    def get_actions(self) -> list[Action]:
+        included = Action.raw_actions()
+        return list(filter(lambda action: action in included, self.actions))
+
+    @staticmethod
+    def get_section_ranges(cue_file: Path) -> Iterable[Tuple[int, int]]:
         def timestamp_to_milliseconds(timestamp):
             hours, minutes, seconds = map(int, timestamp.split(":"))
             total_seconds = hours * 3600 + minutes * 60 + seconds
@@ -76,112 +148,176 @@ class RawSourceOperationResolver:
                 timestamps = line.strip().split("-")
                 if len(timestamps) == 2:
                     start_ms, end_ms = map(timestamp_to_milliseconds, timestamps)
-                    yield TimeRange(start_ms, end_ms)
+                    yield start_ms, end_ms
 
 
 class SeparatedSourceOperationResolver:
-    def __init__(self, path: Path, output_folder: Path):
+    def __init__(self, path: Path, output_dir: Path, actions: list[Action]):
         self.path = path.resolve(strict=True)
-        self.output_folder = output_folder
+        self.output_dir = output_dir
+        self.actions = actions
 
     def __iter__(self) -> Iterable[SeparatedSourceOperation]:
         yield from self.get_operations(self.path)
 
-    def get_operations(self, path: Path):
+    def get_operations(self, path):
+        actions = self.get_actions()
         if path.is_dir():
             for child in path.iterdir():
                 yield from self.get_operations(child)
-        elif path.name == "vocals.wav":
-            yield SeparatedSourceOperation(path, path.parent.name, self.output_folder)
+        elif path.suffix == ".wav":
+            if path.stem == "vocals":
+                yield SeparatedSourceOperation(actions, path, path.parent.name, self.output_dir)
+            else:
+                yield SeparatedSourceOperation(actions, path, path.stem, self.output_dir)
+
+    def get_actions(self) -> list[Action]:
+        included = Action.separated_actions()
+        return list(filter(lambda action: action in included, self.actions))
 
 
 class RawSourceOperationExecutor:
     def __init__(self, operation: RawSourceOperation, use_gpu: bool):
-        super().__init__()
         self.operation = operation
         self.use_gpu = use_gpu
 
-    def __call__(self, workdir: Path) -> Path:
-        section = self.extract_section(
-            self.operation.source,
-            workdir.joinpath(f"{self.operation.section_name}.wav"),
-            self.operation.section_range,
-        )
-        vocals = self.separate_vocals(section)
+    def __call__(self, work_dir: Path) -> Path:
+        actions = self.operation.actions
 
-        return vocals
-
-    def extract_section(
-        self, source: Path, output: Path, section_range: Optional[TimeRange]
-    ) -> Path:
-        segment = AudioSegment.from_file(source)
-
-        (
-            segment[section_range.start_ms : section_range.end_ms]
-            if section_range is not None
-            else segment
-        ).export(output, format="wav")
+        output = self.format_to_wav(self.operation.source, work_dir)
+        for action in actions:
+            if action == Action.EXTRACT:
+                section = self.operation.section
+                assert section is not None
+                output = self.extract_section(output, section)
+            elif action == Action.SEPARATE:
+                output = self.separate_vocals(output, self.use_gpu)
 
         return output
 
-    def separate_vocals(self, source: Path) -> Path:
-        demucs_args = ["demucs", "--two-stems=vocals", source]
-        if not self.use_gpu:
-            demucs_args[1:1] = ["-d", "cpu"]
+    @staticmethod
+    def format_to_wav(source: Path, work_dir: Path):
+        output = work_dir.joinpath(source.with_suffix('.wav').name)
+
+        if not output.exists():
+            log(f"[format_to_wav] started. source: {source}")
+            AudioSegment.from_file(source).export(output, format="wav")
+            log(f"[format_to_wav] finished. output: {output}")
+
+        return output
+
+    @staticmethod
+    def extract_section(source: Path, section: Section) -> Path:
+        index, start_ms, end_ms = section.index, section.start_ms, section.end_ms
+        log(f"[extract_section] started for section {index} ({start_ms} to {end_ms}). source: {source}")
+        output = source.with_stem(f"{source.stem}_{index}")
+
+        AudioSegment.from_wav(source)[start_ms: end_ms].export(output, format="wav")
+
+        log(f"[extract_section] finished for section {index}. output: {output}")
+        return output
+
+    @staticmethod
+    def separate_vocals(source: Path, output_dir: Path, use_gpu: bool) -> Path:
+        log(f"[separate_vocals] started. source: ${source}")
+
+        if not source.suffix == ".wav":
+            raise ValueError(f"source should be wav file")
+
+        demucs_args = [
+            "demucs",
+            "--two-stems",
+            "vocals",
+            "--jobs",
+            str(os.cpu_count()),
+            "--out",
+            source.parent,
+            source
+        ]
+        if not use_gpu:
+            demucs_args[1:1] = ["--device", "cpu"]
 
         subprocess.run(demucs_args, check=True)
 
-        output = next(SEPARATED_FOLDER.glob(f"**/{source.stem}/vocals.wav"))
+        output = next(source.parent.glob(f"**/{source.stem}/vocals.wav"))
 
+        if output_dir != SEPARATED_FOLDER:
+            shutil.copy(output, SEPARATED_FOLDER.joinpath(output.name))
+
+        log(f"[separate_vocals] finished. output: ${output}")
         return output
 
 
 class SeparatedSourceOperationExecutor:
-    def __init__(self, operation: SeparatedSourceOperation):
-        super().__init__()
+    def __init__(self, operation: SeparatedSourceOperation, chunk_length: int):
         self.operation = operation
+        self.chunk_length = chunk_length
 
-    def __call__(self, workdir: Path) -> list[Path]:
-        silence_removed = self.remove_silence(
-            self.operation.source,
-            workdir.joinpath(f"{self.operation.source_name}_silenceremoved.wav"),
-        )
-        compressed = self.compress(
-            silence_removed,
-            silence_removed.with_stem(f"{silence_removed.stem}_compressed"),
-        )
-        normalized = self.normalize(
-            compressed,
-            compressed.with_stem(f"{compressed.stem}_normalized"),
-        )
-        mono = self.convert_to_mono(
-            normalized, normalized.with_stem(f"{normalized.stem}_mono")
-        )
-        spliced = self.splice(mono)
+        output_path = self.operation.output_dir
+        if not output_path.exists():
+            output_path.mkdir(parents=True)
 
-        return list(spliced)
+    def __call__(self, work_dir: Path) -> Iterable[Path]:
+        actions = self.operation.actions
 
-    def remove_silence(self, source: Path, output: Path) -> Path:
-        (
-            reduce(
-                add,
-                silence.split_on_silence(
-                    AudioSegment.from_wav(source), silence_thresh=-50
-                ),
-                AudioSegment.empty(),
-            ).export(output, format="wav")
-        )
+        output = self.copy_to_work_dir(self.operation.source, self.operation.source_name, work_dir)
 
+        for action in actions:
+            if action == Action.REMOVE_SILENCE:
+                output = self.remove_silence(output)
+            elif action == Action.COMPRESS:
+                output = self.compress(output)
+            elif action == Action.NORMALIZE:
+                output = self.normalize(output)
+            elif action == Action.MONO:
+                output = self.convert_to_mono(output)
+
+        if Action.SPLIT in actions:
+            output = self.split_to_chunks(output, self.chunk_length)
+
+        output_list = [output] if isinstance(output, Path) else output
+        for output in output_list:
+            yield self.export_to_output_dir(output, self.operation.output_dir)
+
+    @staticmethod
+    def copy_to_work_dir(source: Path, source_name: str, work_dir: Path) -> Path:
+        log(f"[copy_to_work_dir] started. source: {source}")
+        output = work_dir.joinpath(source.with_stem(source_name).name)
+
+        shutil.copy(source, output)
+
+        log(f"[copy_to_work_dir] finished. output: {output}")
         return output
 
-    def compress(self, source: Path, output: Path) -> Path:
-        effects.compress_dynamic_range(AudioSegment.from_wav(source)).export(
-            output, format="wav"
-        )
+    @staticmethod
+    def remove_silence(source: Path) -> Path:
+        log(f"[remove_silence] started. source: {source}")
+        output = source.with_stem(f"{source.stem}_silenceremoved")
 
+        reduce(
+            add,
+            silence.split_on_silence(AudioSegment.from_wav(source), silence_thresh=-50),
+            AudioSegment.empty()
+        ).export(output, format="wav")
+
+        log(f"[remove_silence] finished. output: {output}")
         return output
 
-    def normalize(self, source: Path, output: Path) -> Path:
+    @staticmethod
+    def compress(source: Path) -> Path:
+        log(f"[compress] started. source: {source}")
+        output = source.with_stem(f"{source.stem}_compressed")
+
+        effects.compress_dynamic_range(AudioSegment.from_wav(source)).export(output, format="wav")
+
+        log(f"[compress] finished. output: {output}")
+        return output
+
+    @staticmethod
+    def normalize(source: Path) -> Path:
+        output = source.with_stem(f"{source.stem}_normalized")
+        log(f"[normalize] started. source: {source}")
+
         normalizer = FFmpegNormalize(
             print_stats=True,
             keep_loudness_range_target=True,
@@ -191,111 +327,133 @@ class SeparatedSourceOperationExecutor:
         normalizer.add_media_file(str(source), str(output))
         normalizer.run_normalization()
 
+        log(f"[normalize] finished. output: {output}")
         return output
 
-    def convert_to_mono(self, source: Path, output: Path) -> Path:
-        (
-            AudioSegment.from_wav(source)
-            .set_channels(1)
-            .set_sample_width(2)
-            .set_frame_rate(44100)
-            .export(output, format="wav")
-        )
+    @staticmethod
+    def convert_to_mono(source: Path) -> Path:
+        log(f"[convert_to_mono] started. source: {source}")
+        output = source.with_stem(f"{source.stem}_mono")
 
+        AudioSegment.from_wav(source).set_channels(1).export(output, format="wav")
+
+        log(f"[convert_to_mono] finished. output: {output}")
         return output
 
-    def splice(self, source: Path) -> Iterable[Path]:
-        chunk_length_ms = CHUNK_LENGTH * 1000
+    @staticmethod
+    def split_to_chunks(source: Path, chunk_length: int) -> Iterable[Path]:
+        log(f"[split_to_chunks] started. source: {source}")
+        chunk_length_ms = chunk_length * 1000
         chunks = filter(
-            lambda chunk: len(chunk) == chunk_length_ms,
+            lambda segment: len(segment) == chunk_length_ms,
             AudioSegment.from_wav(source)[::chunk_length_ms],
         )
 
         today = datetime.now().strftime("%Y%m%d")
         batch_id = token_hex(3)
         for index, chunk in enumerate(chunks):
-            output = self.operation.output_folder.joinpath(
-                f"{source.stem}_spliced_{today}_{batch_id}_{index}.wav"
-            )
+            output = source.parent.joinpath(f"{source.stem}_spliced_{today}_{batch_id}_{index}.wav")
             chunk.export(output, format="wav")
+
+            log(f"[split_to_chunks] finished for chunk {index}. output: {output}")
             yield output
+
+    @staticmethod
+    def export_to_output_dir(source: Path, output_dir: Path) -> Path:
+        log(f"[export_to_output_dir] started. source: {source}")
+        output = output_dir.joinpath(source.name)
+
+        (
+            AudioSegment.from_wav(source)
+            .set_sample_width(2)
+            .set_frame_rate(44100)
+            .export(output, format="wav")
+        )
+
+        log(f"[export_to_output_dir] finished. output: {output}")
+        return output
 
 
 def get_raw_executor(
-    path: Path, use_cue: bool, use_gpu: bool
+        path: Path, output_dir: Path, actions: list[Action], use_gpu: bool
 ) -> Iterable[RawSourceOperationExecutor]:
-    for operation in RawSourceOperationResolver(path, use_cue):
+    for operation in RawSourceOperationResolver(path, output_dir, actions):
         executor = RawSourceOperationExecutor(operation, use_gpu)
         yield executor
 
 
-def handle_raw_executor(executor: RawSourceOperationExecutor) -> Path:
-    with TemporaryDirectory() as workdir:
-        result = executor(workdir)
-        return result
+def handle_raw_executor(work_dir: Path, executor: RawSourceOperationExecutor) -> Path:
+    result = executor(Path(work_dir.name))
+    return result
 
 
-def get_separated_executor(path: Path) -> Iterable[SeparatedSourceOperationExecutor]:
-    for operation in SeparatedSourceOperationResolver(path, OUTPUT_FOLDER):
-        executor = SeparatedSourceOperationExecutor(operation)
-        yield executor
+def get_separated_executor(
+        paths: Iterable[Path], output_dir: Path, actions: list[Action], chunk_length: int
+) -> Iterable[SeparatedSourceOperationExecutor]:
+    for path in paths:
+        for operation in SeparatedSourceOperationResolver(path, output_dir, actions):
+            executor = SeparatedSourceOperationExecutor(operation, chunk_length)
+            yield executor
 
 
 def handle_separated_executor(executor: SeparatedSourceOperationExecutor):
-    workdir = Path(multiprocessing.util.get_temp_dir())
-    result = executor(workdir)
+    work_dir = Path(multiprocessing.util.get_temp_dir())
+    result = executor(work_dir)
     for separated_path in result:
-        print(f"output: {separated_path}")
+        log(f"output: {separated_path}")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "path",
-        nargs="?",
-        type=Path,
-        default=Path("vod"),
-        help="file or directory to process",
-    )
-    parser.add_argument(
-        "--gpu", action="store_true", help="use gpu in vocal separation"
-    )
-    parser.add_argument(
-        "--no-cue",
-        action="store_true",
-        help="ignore cue file; processing will run on whole file",
-    )
-    parser.add_argument(
-        "--skip-separate", action="store_true", help="skip vocal separation"
-    )
-    parser.add_argument(
-        "--separate-only", action="store_true", help="run vocal separation only"
-    )
-    parser.add_argument(
-        "--separate-single",
-        action="store_true",
-        help="separate single file; equivalent to --no-cue and --separate-only",
-    )
+    parser.add_argument("--input", "-i", type=Path, default=DEFAULT_INPUT_FOLDER, help="file or directory to process")
+    parser.add_argument("--output", "-o", type=Optional[Path], default=None, help="output directory")
+    parser.add_argument("--gpu", action="store_true", help="use gpu in vocal separation")
+    action_values = ", ".join(map(str, Action))
+    parser.add_argument("--actions", nargs="+", type=Action, default=list(Action),
+                        help=f"actions to run in order specified, valid values are: {action_values}")
+    separated_actions = " ".join(map(str, Action.separated_actions()))
+    parser.add_argument("--from-separated", action="store_true",
+                        help=f"perform actions on separated sources; equivalent to --actions={separated_actions}")
+    parser.add_argument("--separate-single", action="store_true",
+                        help="separate single file; equivalent to --actions=separate")
+    parser.add_argument("--chunk-length", type=int, default=DEFAULT_CHUNK_LENGTH,
+                        help="length to split output file into")
     args = parser.parse_args()
 
+    if not args.input.exists():
+        raise ValueError("input not exist")
+
     if args.separate_single:
-        args.no_cue = True
-        args.separate_only = True
+        args.actions = [Action.SEPARATE]
+    elif args.from_separated:
+        args.actions = Action.separated_actions()
+    args.actions = sorted(args.actions)
 
-    OUTPUT_FOLDER.mkdir(parents=True, exist_ok=True)
+    if args.output is None:
+        if set(args.actions) | set(Action.separated_actions()):
+            args.output = DEFAULT_OUTPUT_FOLDER
+        elif Action.SEPARATE in args.actions:
+            args.output = SEPARATED_FOLDER
+        else:
+            args.output = args.input if args.input.is_dir() else args.input.parent
+    elif not args.output.is_dir():
+        raise ValueError("output not a directory")
 
-    if args.skip_separate:
+    tmp_dir = TemporaryDirectory()
+    if args.from_separated:
         raw_results = [SEPARATED_FOLDER]
     else:
         raw_results = map(
-            handle_raw_executor,
-            get_raw_executor(args.path, not args.no_cue, args.gpu),
+            partial(handle_raw_executor, tmp_dir),
+            get_raw_executor(args.input, args.output, args.actions, args.gpu)
         )
 
-    for raw_path in raw_results:
-        if not args.separate_only:
-            with multiprocessing.Pool() as p:
-                p.map(
-                    handle_separated_executor,
-                    get_separated_executor(raw_path),
-                )
+    with multiprocessing.Pool() as p:
+        p.map(
+            handle_separated_executor,
+            get_separated_executor(
+                raw_results, args.output, args.actions, args.chunk_length
+            )
+        )
+
+    tmp_dir.cleanup()
