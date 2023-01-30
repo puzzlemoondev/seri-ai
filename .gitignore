@@ -295,9 +295,5 @@ poetry.toml
 
 .idea/
 
-raw/
 vod/
-data/
-results/
 separated/
-checkpoints/

@@ -28,3 +28,9 @@ Input files should have corresponding `.cue` file with format `hh:mm:ss-hh:mm:ss
 ### Train
 
 `docker-compose run train`
+
+### Infer
+
+`docker-compose run infer`
+
+Input file should be inside `raw` folder with name `vocals.wav`
