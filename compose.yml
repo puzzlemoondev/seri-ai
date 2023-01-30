@@ -14,7 +14,7 @@ services:
       - ./checkpoints/seri:/home/rocm-user/diff-svc/checkpoints/seri
     environment:
       - CUDA_VISIBLE_DEVICES=0
-    command: ["bash", "-l"]
+    command: ['bash', '-l']
     shm_size: 8gb
   diff-svc-tty:
     extends: diff-svc
@@ -22,15 +22,27 @@ services:
     stdin_open: true
   diff-svc-cmd:
     extends: diff-svc
-    entrypoint: ["bash", "-l", "-c"]
+    entrypoint: ['bash', '-l', '-c']
   preprocess:
     extends: diff-svc-cmd
     environment:
       - PYTHONPATH=.
-    command: ["conda run --no-capture-output -n gfx803 python preprocessing/binarize.py --config training/config_nsf.yaml"]
+    command:
+      [
+        'conda run --no-capture-output -n gfx803 python preprocessing/binarize.py --config training/config_nsf.yaml',
+      ]
   train:
     extends: diff-svc-cmd
-    command: ["conda run --no-capture-output -n gfx803 python run.py --config training/config_nsf.yaml --exp_name seri --reset"]
+    command:
+      [
+        'conda run --no-capture-output -n gfx803 python run.py --config training/config_nsf.yaml --exp_name seri --reset',
+      ]
   infer:
-    extends: diff-svc
-    entrypoint: ["bash", "-l", "-c", "conda run --no-capture-output -n gfx803 python infer.py"]
+    extends: diff-svc-cmd
+    volumes:
+      - ./raw:/home/rocm-user/diff-svc/raw
+      - ./results:/home/rocm-user/diff-svc/results
+    command:
+      [
+        'conda run --no-capture-output -n gfx803 python infer.py --config_path checkpoints/seri/config.yaml --project_name seri --model_path checkpoints/seri/model_ckpt_steps_100000.ckpt --format wav --file_names vocals.wav',
+      ]
