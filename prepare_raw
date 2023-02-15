@@ -406,7 +406,7 @@ def handle_separated_executor(executor: SeparatedSourceOperationExecutor):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", "-i", type=Path, default=DEFAULT_INPUT_FOLDER, help="file or directory to process")
-    parser.add_argument("--output", "-o", type=Optional[Path], default=None, help="output directory")
+    parser.add_argument("--output", "-o", type=Path, default=None, help="output directory")
     parser.add_argument("--gpu", action="store_true", help="use gpu in vocal separation")
     action_values = ", ".join(map(str, Action))
     parser.add_argument("--actions", nargs="+", type=Action, default=list(Action),

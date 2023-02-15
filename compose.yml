@@ -44,5 +44,5 @@ services:
       - ./results:/home/rocm-user/diff-svc/results
     command:
       [
-        'conda run --no-capture-output -n gfx803 python infer.py --config_path checkpoints/seri/config.yaml --project_name seri --model_path checkpoints/seri/model_ckpt_steps_100000.ckpt --format wav --file_names vocals.wav',
+        'conda run --no-capture-output -n gfx803 python infer.py --config_path checkpoints/seri/config.yaml --project_name seri --model_path checkpoints/seri/model_ckpt_steps_1000000.ckpt --format wav --file_names vocals.wav',
       ]
